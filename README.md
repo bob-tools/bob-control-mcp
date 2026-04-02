@@ -59,16 +59,6 @@ Plugin auto-detects: ADB if a device is connected via USB, otherwise cloud. To s
 | `phone_list_devices` | List devices (cloud) |
 | `phone_select_device` | Select device (cloud) |
 
-## Publishing new version
-
-```bash
-cd /Users/ivbar/code/bob-control-mcp
-npm version patch
-git push && git push --tags
-```
-
-GitHub Action publishes to npm automatically on tag push.
-
 ## License
 
 MIT
