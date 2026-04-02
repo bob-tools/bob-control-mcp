@@ -1,0 +1,32 @@
+{
+  "name": "bob-control-mcp",
+  "version": "1.0.0",
+  "description": "MCP plugin for remote Android phone control — ADB (local) or cloud relay",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "bob-control-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "android",
+    "phone-control",
+    "adb",
+    "accessibility",
+    "automation"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nickolay-kondratyev/bob-control-mcp"
+  },
+  "files": [
+    "src/",
+    ".claude-plugin/",
+    ".mcp.json"
+  ]
+}

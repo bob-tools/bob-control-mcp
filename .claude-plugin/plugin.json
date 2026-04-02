@@ -1,0 +1,6 @@
+{
+  "name": "bob-control",
+  "version": "1.0.0",
+  "description": "Remote phone control via ADB (local) or cloud relay. Screenshot, tap, swipe, type, read UI, manage apps and notifications.",
+  "author": "bob.tools"
+}
