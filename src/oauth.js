@@ -44,11 +44,13 @@ function generateCodeChallenge(verifier) {
 
 // ── HTTP helper ──
 
-function httpPost(url, body) {
+function httpPost(url, body, { formEncoded = false } = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const mod = parsed.protocol === "https:" ? https : http;
-    const bodyStr = JSON.stringify(body);
+    const bodyStr = formEncoded
+      ? new URLSearchParams(body).toString()
+      : JSON.stringify(body);
 
     const req = mod.request(
       {
@@ -57,7 +59,7 @@ function httpPost(url, body) {
         path: parsed.pathname + parsed.search,
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
+          "Content-Type": formEncoded ? "application/x-www-form-urlencoded" : "application/json",
           "Content-Length": Buffer.byteLength(bodyStr),
         },
       },
@@ -258,7 +260,7 @@ export async function authorize() {
     code_verifier: codeVerifier,
     client_id: client.client_id,
     redirect_uri: REDIRECT_URI,
-  });
+  }, { formEncoded: true });
 
   if (tokenResult.status !== 200) {
     throw new Error(`Token exchange failed: ${JSON.stringify(tokenResult.body)}`);
@@ -290,7 +292,7 @@ export async function refreshAccessToken() {
     grant_type: "refresh_token",
     refresh_token: tokens.refresh_token,
     client_id: client?.client_id,
-  });
+  }, { formEncoded: true });
 
   if (result.status !== 200) {
     // Refresh token expired or invalid — need full re-auth
