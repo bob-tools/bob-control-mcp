@@ -135,19 +135,38 @@ async function sendCommandAdb(command, params) {
     { Authorization: `Bearer ${token}` }
   );
 
-  if (result.status === 401 && result.body?.error?.includes("expired")) {
+  if (result.status === 401) {
+    // Token expired or invalid — force refresh and retry once
     adbToken = null;
     adbTokenFetchedAt = 0;
-    const newToken = fetchAdbToken();
-    result = await httpRequest(
-      `http://127.0.0.1:${ADB_PORT}/command`,
-      "POST",
-      { command, params: params || undefined },
-      { Authorization: `Bearer ${newToken}` }
+    try {
+      const newToken = fetchAdbToken();
+      result = await httpRequest(
+        `http://127.0.0.1:${ADB_PORT}/command`,
+        "POST",
+        { command, params: params || undefined },
+        { Authorization: `Bearer ${newToken}` }
+      );
+    } catch (e) {
+      throw new Error(
+        "ADB Unauthorized: token refresh failed.\n" +
+          "Fix: restart this MCP server (it will re-read the token from device).\n" +
+          "The ADB token rotates every 15 minutes — a server restart picks up the fresh one."
+      );
+    }
+  }
+
+  if (result.status === 401) {
+    throw new Error(
+      "ADB Unauthorized even after token refresh.\n" +
+        "Possible causes:\n" +
+        "1. ADB server in BOB Control app was restarted (generates new token) — restart this MCP server\n" +
+        "2. Accessibility Service is disabled — re-enable in Settings → Accessibility → BOB Control\n" +
+        "3. App was reinstalled — re-enable Accessibility Service in Settings"
     );
   }
 
-  if (result.status !== 200) throw new Error(result.body?.error || `HTTP ${result.status}`);
+  if (result.status !== 200) throw new Error(result.body?.error || `ADB command failed: HTTP ${result.status}`);
   return result.body;
 }
 
@@ -410,9 +429,15 @@ async function executeTool(name, args) {
         log("Using cloud transport (authenticated)");
       } else {
         return err(
-          "No transport available.\n" +
-            "- For ADB: connect phone via USB, enable ADB server in BOB Control app\n" +
-            "- For cloud: use phone_authenticate to log in first"
+          "No transport available. Cannot reach device.\n\n" +
+            "Option 1 — ADB (local, faster):\n" +
+            "  1. Connect phone via USB\n" +
+            "  2. Run 'adb devices' to verify connection\n" +
+            "  3. In BOB Control app → enable ADB server (Step 6)\n" +
+            "  4. Restart this MCP server to re-detect\n\n" +
+            "Option 2 — Cloud (remote):\n" +
+            "  1. Use phone_authenticate to log in\n" +
+            "  2. In BOB Control app → pair device (Step 1)"
         );
       }
     }
@@ -425,6 +450,20 @@ async function executeTool(name, args) {
     // Cloud mode — proxy to McpControlServlet
     return await cloudMcpCall(name, args);
   } catch (e) {
+    if (e.code === "ECONNREFUSED" || e.message?.includes("ECONNREFUSED")) {
+      return err(
+        "Cannot connect to ADB server on device (connection refused).\n" +
+          "The ADB port forward exists but the server on the device is not running.\n" +
+          "Fix: in BOB Control app → Step 6, toggle ADB server OFF then ON again."
+      );
+    }
+    if (e.code === "ECONNRESET" || e.message?.includes("socket hang up")) {
+      return err(
+        "Connection to device lost (socket hang up).\n" +
+          "This usually means the MCP server or ADB connection was interrupted.\n" +
+          "Fix: restart this MCP server. If using USB, re-plug the cable."
+      );
+    }
     return err(e.message);
   }
 }
@@ -476,7 +515,12 @@ function handleLogout() {
 function handleSetTransport(mode) {
   if (mode === "adb") {
     if (!adbAvailable()) return err("No ADB device connected.");
-    if (!adbServerRunning()) return err("ADB server not running in BOB Control app. Enable it in Step 6.");
+    if (!adbServerRunning())
+      return err(
+        "ADB server not responding.\n" +
+          "Fix: in BOB Control app → Step 6, toggle ADB server ON.\n" +
+          "Also check: USB cable connected and 'adb devices' shows your device."
+      );
     transport = "adb";
     return ok("Transport: ADB (local). Commands go directly to device via USB.");
   }
