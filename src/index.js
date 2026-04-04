@@ -54,8 +54,8 @@ function adbAvailable() {
   }
 }
 
-function ensureAdbForward() {
-  if (adbPortForwarded) return;
+function ensureAdbForward(force = false) {
+  if (adbPortForwarded && !force) return;
   execSync(`adb forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 5000 });
   adbPortForwarded = true;
 }
@@ -451,9 +451,28 @@ async function executeTool(name, args) {
     return await cloudMcpCall(name, args);
   } catch (e) {
     if (e.code === "ECONNREFUSED" || e.message?.includes("ECONNREFUSED")) {
+      // Port forward may be stale — re-establish and retry once
+      if (transport === "adb") {
+        try {
+          log("Connection refused — re-establishing ADB port forward and retrying...");
+          ensureAdbForward(true);
+          adbToken = null;
+          adbTokenFetchedAt = 0;
+          const retryResult = await executeAdb(name, args);
+          return retryResult;
+        } catch (retryErr) {
+          if (retryErr.code === "ECONNREFUSED" || retryErr.message?.includes("ECONNREFUSED")) {
+            return err(
+              "Cannot connect to ADB server on device (connection refused).\n" +
+                "The ADB port forward was re-established but the server on the device is not responding.\n" +
+                "Fix: in BOB Control app → Step 6, toggle ADB server OFF then ON again."
+            );
+          }
+          return err(retryErr.message);
+        }
+      }
       return err(
         "Cannot connect to ADB server on device (connection refused).\n" +
-          "The ADB port forward exists but the server on the device is not running.\n" +
           "Fix: in BOB Control app → Step 6, toggle ADB server OFF then ON again."
       );
     }
