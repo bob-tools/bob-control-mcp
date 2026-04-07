@@ -16,6 +16,9 @@ import { execSync } from "child_process";
 import { createInterface } from "readline";
 import http from "http";
 import https from "https";
+import fs from "fs";
+import path from "path";
+import os from "os";
 import { authorize, getAccessToken, isAuthenticated, logout } from "./oauth.js";
 
 // ── Config ──
@@ -33,6 +36,7 @@ let adbToken = null;
 let adbTokenFetchedAt = 0;
 const ADB_TOKEN_REFRESH_MS = 14 * 60 * 1000;
 let adbPortForwarded = false;
+let adbSerial = null; // selected device serial (null = auto if only one)
 
 // Cloud state
 let cloudSessionId = null;
@@ -43,27 +47,129 @@ function log(msg) {
   process.stderr.write(`[bob-control] ${msg}\n`);
 }
 
+// ── Device lock (file-based, cross-process) ──
+
+const LOCK_DIR = path.join(os.homedir(), ".bob-control-mcp");
+const LOCK_DEFAULT_S = 10;
+const LOCK_MAX_S = 120;
+const MY_PID = process.pid;
+
+function lockFilePath(deviceId) {
+  const safe = (deviceId || "adb-local").replace(/[^a-zA-Z0-9_-]/g, "_");
+  return path.join(LOCK_DIR, `lock_${safe}.json`);
+}
+
+/**
+ * Check if device is locked by another process.
+ * Returns { locked: false } or { locked: true, remainingSeconds, pid }.
+ */
+function checkDeviceLock(deviceId) {
+  const fp = lockFilePath(deviceId);
+  try {
+    const data = JSON.parse(fs.readFileSync(fp, "utf-8"));
+    if (data.pid === MY_PID) return { locked: false };
+    if (Date.now() > data.expiresAt) {
+      // Expired — clean up
+      try { fs.unlinkSync(fp); } catch {}
+      return { locked: false };
+    }
+    // Check if holding process is still alive
+    try {
+      process.kill(data.pid, 0); // signal 0 = just check existence
+    } catch {
+      // Process is dead — stale lock
+      try { fs.unlinkSync(fp); } catch {}
+      return { locked: false };
+    }
+    const remaining = Math.ceil((data.expiresAt - Date.now()) / 1000);
+    return { locked: true, remainingSeconds: Math.max(1, remaining), pid: data.pid };
+  } catch {
+    return { locked: false };
+  }
+}
+
+function acquireDeviceLock(deviceId, seconds) {
+  if (seconds <= 0) return;
+  fs.mkdirSync(LOCK_DIR, { recursive: true });
+  const fp = lockFilePath(deviceId);
+  fs.writeFileSync(fp, JSON.stringify({ pid: MY_PID, expiresAt: Date.now() + seconds * 1000 }));
+}
+
+function releaseDeviceLock(deviceId) {
+  const fp = lockFilePath(deviceId);
+  try {
+    const data = JSON.parse(fs.readFileSync(fp, "utf-8"));
+    if (data.pid === MY_PID) fs.unlinkSync(fp);
+  } catch {}
+}
+
 // ── ADB helpers ──
 
-function adbAvailable() {
-  try {
-    const out = execSync("adb devices", { stdio: "pipe", encoding: "utf-8", timeout: 5000 });
-    return out.trim().split("\n").slice(1).filter((l) => l.includes("\tdevice")).length > 0;
-  } catch {
-    return false;
+/** Resolve full path to adb binary (PATH may be minimal in MCP context). */
+const ADB_BIN = (() => {
+  // Try absolute paths first (MCP servers often have minimal PATH)
+  const absolutePaths = [
+    "/opt/homebrew/bin/adb",
+    "/usr/local/bin/adb",
+    `${os.homedir()}/Library/Android/sdk/platform-tools/adb`,
+    `${os.homedir()}/Android/Sdk/platform-tools/adb`,
+  ];
+  for (const p of absolutePaths) {
+    try {
+      if (fs.existsSync(p)) {
+        log(`Found adb: ${p}`);
+        return p;
+      }
+    } catch {}
   }
+  // Fall back to PATH lookup
+  try {
+    execSync("adb version", { stdio: "pipe", timeout: 5000 });
+    log("Found adb in PATH");
+    return "adb";
+  } catch {}
+  log("WARNING: adb not found");
+  return "adb";
+})();
+
+/** Returns "-s <serial> " prefix if a device is selected, or "" for auto. */
+function adbPrefix() {
+  return adbSerial ? `${ADB_BIN} -s ${adbSerial} ` : `${ADB_BIN} `;
+}
+
+/** Parse `adb devices -l` into [{serial, status, model, product, device, transportId}]. */
+function listAdbDevices() {
+  try {
+    const out = execSync(`${ADB_BIN} devices -l`, { stdio: "pipe", encoding: "utf-8", timeout: 5000 });
+    return out.trim().split("\n").slice(1)
+      .filter((l) => /\s+device\b/.test(l))
+      .map((line) => {
+        const [serial] = line.split(/\s+/);
+        const model = line.match(/model:(\S+)/)?.[1] || "";
+        const product = line.match(/product:(\S+)/)?.[1] || "";
+        const device = line.match(/device:(\S+)/)?.[1] || "";
+        const tid = line.match(/transport_id:(\d+)/)?.[1] || "";
+        return { serial, model, product, device, transport_id: tid };
+      });
+  } catch {
+    return [];
+  }
+}
+
+function adbAvailable() {
+  return listAdbDevices().length > 0;
 }
 
 function ensureAdbForward(force = false) {
   if (adbPortForwarded && !force) return;
-  execSync(`adb forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 5000 });
+  execSync(`${adbPrefix()}forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 5000 });
   adbPortForwarded = true;
 }
 
 function fetchAdbToken() {
   const now = Date.now();
   if (adbToken && now - adbTokenFetchedAt < ADB_TOKEN_REFRESH_MS) return adbToken;
-  adbToken = execSync("adb shell run-as bob.tools.control cat files/adb_token", {
+  adbToken = execSync(`${adbPrefix()}shell run-as bob.tools.control cat files/adb_token`, {
     stdio: "pipe",
     encoding: "utf-8",
     timeout: 5000,
@@ -73,6 +179,26 @@ function fetchAdbToken() {
 }
 
 function adbServerRunning() {
+  // If no serial selected and multiple devices, try each one
+  if (!adbSerial) {
+    const devices = listAdbDevices();
+    if (devices.length > 1) {
+      for (const d of devices) {
+        try {
+          execSync(`${ADB_BIN} -s ${d.serial} forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 5000 });
+          execSync(`${ADB_BIN} -s ${d.serial} shell run-as bob.tools.control cat files/adb_token`, { stdio: "pipe", timeout: 5000 });
+          // Found a device with ADB server — auto-select it
+          adbSerial = d.serial;
+          adbPortForwarded = true;
+          adbToken = null;
+          adbTokenFetchedAt = 0;
+          log(`Auto-selected device with ADB server: ${d.serial}`);
+          return true;
+        } catch {}
+      }
+      return false;
+    }
+  }
   try {
     ensureAdbForward();
     fetchAdbToken();
@@ -240,7 +366,24 @@ const META_TOOLS = [
     description: "Show current connection status: transport mode, device, ADB/cloud auth availability.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "phone_unlock_device",
+    description: "Release the exclusive lock on a device, allowing other sessions to control it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        device_id: { type: "string", description: "Device ID to unlock (optional, uses current device if omitted)" },
+      },
+    },
+  },
 ];
+
+const LOCK_PROP = {
+  lock: {
+    type: "integer",
+    description: "Exclusive lock duration in seconds (default: 10, max: 120). Prevents other sessions from controlling this device. Set to 0 to skip.",
+  },
+};
 
 const DEVICE_TOOLS = [
   {
@@ -273,23 +416,20 @@ const DEVICE_TOOLS = [
   {
     name: "phone_screenshot",
     description: "Take a screenshot of the phone screen. Returns JPEG image.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
   },
   {
     name: "phone_get_ui_tree",
     description:
       "Get the UI accessibility tree. Returns text content, bounds, and element type. Preferred over screenshot.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
   },
   {
     name: "phone_tap",
     description: "Tap at specific screen coordinates.",
     inputSchema: {
       type: "object",
-      properties: {
-        x: { type: "number" },
-        y: { type: "number" },
-      },
+      properties: { x: { type: "number" }, y: { type: "number" }, ...LOCK_PROP },
       required: ["x", "y"],
     },
   },
@@ -302,6 +442,7 @@ const DEVICE_TOOLS = [
         text: { type: "string", description: "Text or content description to find" },
         exact: { type: "boolean", description: "Exact match (default: false)" },
         index: { type: "integer", description: "Which match to tap (0-based)" },
+        ...LOCK_PROP,
       },
       required: ["text"],
     },
@@ -317,6 +458,7 @@ const DEVICE_TOOLS = [
         endX: { type: "number" },
         endY: { type: "number" },
         duration: { type: "number", description: "Duration in ms (default: 300)" },
+        ...LOCK_PROP,
       },
       required: ["startX", "startY", "endX", "endY"],
     },
@@ -326,50 +468,50 @@ const DEVICE_TOOLS = [
     description: "Type text into the currently focused input field.",
     inputSchema: {
       type: "object",
-      properties: { text: { type: "string" } },
+      properties: { text: { type: "string" }, ...LOCK_PROP },
       required: ["text"],
     },
   },
   {
     name: "phone_press_back",
     description: "Press the Back button.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
   },
   {
     name: "phone_press_home",
     description: "Press the Home button.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
   },
   {
     name: "phone_press_recents",
     description: "Press the Recent Apps button.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
   },
   {
     name: "phone_get_apps",
     description: "List installed apps.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
   },
   {
     name: "phone_open_app",
     description: "Open an app by package name.",
     inputSchema: {
       type: "object",
-      properties: { package: { type: "string" } },
+      properties: { package: { type: "string" }, ...LOCK_PROP },
       required: ["package"],
     },
   },
   {
     name: "phone_get_notifications",
     description: "Get active notifications.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
   },
   {
     name: "phone_open_notification",
     description: "Open a notification by key.",
     inputSchema: {
       type: "object",
-      properties: { key: { type: "string" } },
+      properties: { key: { type: "string" }, ...LOCK_PROP },
       required: ["key"],
     },
   },
@@ -378,14 +520,30 @@ const DEVICE_TOOLS = [
     description: "Dismiss a notification by key.",
     inputSchema: {
       type: "object",
-      properties: { key: { type: "string" } },
+      properties: { key: { type: "string" }, ...LOCK_PROP },
       required: ["key"],
     },
   },
   {
     name: "phone_dismiss_all_notifications",
     description: "Dismiss all notifications.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
+  },
+  {
+    name: "phone_enable_adb",
+    description: "Enable ADB local server on the device. Returns port and auth token for direct USB control.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        auto_start: { type: "boolean", description: "Auto-start on service restart (default: true)" },
+        ...LOCK_PROP,
+      },
+    },
+  },
+  {
+    name: "phone_disable_adb",
+    description: "Disable ADB local server on the device.",
+    inputSchema: { type: "object", properties: { ...LOCK_PROP } },
   },
 ];
 
@@ -407,6 +565,8 @@ const TOOL_TO_ADB_COMMAND = {
   phone_open_notification: "open_notification",
   phone_dismiss_notification: "dismiss_notification",
   phone_dismiss_all_notifications: "dismiss_all_notifications",
+  phone_enable_adb: "enable_adb",
+  phone_disable_adb: "disable_adb",
 };
 
 // ── Tool execution ──
@@ -418,6 +578,10 @@ async function executeTool(name, args) {
     if (name === "phone_logout") return handleLogout();
     if (name === "phone_set_transport") return handleSetTransport(args.mode);
     if (name === "phone_status") return handleStatus();
+    if (name === "phone_unlock_device") {
+      if (transport === "adb") return handleUnlock(args.device_id);
+      // Cloud mode — fall through to cloudMcpCall below
+    }
 
     // Auto-detect transport on first command
     if (!transport) {
@@ -490,9 +654,31 @@ async function executeTool(name, args) {
 async function executeAdb(name, args) {
   const command = TOOL_TO_ADB_COMMAND[name];
   if (!command) {
-    // Cloud-only tools called in ADB mode
-    if (name === "phone_list_devices" || name === "phone_select_device") {
-      return ok("Not needed in ADB mode — device is connected directly via USB.");
+    // ADB device management
+    if (name === "phone_list_devices") {
+      const devices = listAdbDevices();
+      if (devices.length === 0) return err("No ADB devices connected.");
+      const lines = devices.map((d) => {
+        const selected = d.serial === adbSerial ? " ← selected" : "";
+        return `${d.serial}  ${d.model || d.product || d.device}${selected}`;
+      });
+      if (!adbSerial && devices.length === 1) {
+        lines[0] += " (auto)";
+      }
+      return ok(`Connected devices (${devices.length}):\n${lines.join("\n")}` +
+        (devices.length > 1 && !adbSerial ? "\n\nMultiple devices — use phone_select_device to pick one." : ""));
+    }
+    if (name === "phone_select_device") {
+      const serial = args.device_id;
+      const devices = listAdbDevices();
+      const match = devices.find((d) => d.serial === serial);
+      if (!match) return err(`Device ${serial} not found. Available: ${devices.map((d) => d.serial).join(", ")}`);
+      adbSerial = serial;
+      // Reset port forward and token for the new device
+      adbPortForwarded = false;
+      adbToken = null;
+      adbTokenFetchedAt = 0;
+      return ok(`Selected device: ${serial} (${match.model || match.product})`);
     }
     if (name === "phone_check_command") {
       return ok("Not needed in ADB mode — commands return synchronously.");
@@ -500,7 +686,30 @@ async function executeAdb(name, args) {
     return err(`Unknown tool: ${name}`);
   }
 
-  const result = await sendCommandAdb(command, args);
+  // Auto-select if only one device; error if multiple and none selected
+  if (!adbSerial) {
+    const devices = listAdbDevices();
+    if (devices.length > 1) {
+      return err(`Multiple ADB devices connected. Use phone_select_device first.\nDevices: ${devices.map((d) => d.serial).join(", ")}`);
+    }
+    if (devices.length === 1) adbSerial = devices[0].serial;
+  }
+
+  // Device lock check (file-based, cross-process)
+  const deviceId = adbSerial || "adb-local";
+  const lockCheck = checkDeviceLock(deviceId);
+  if (lockCheck.locked) {
+    return err(`Device is currently in use by another session (pid ${lockCheck.pid}). It will be available in ~${lockCheck.remainingSeconds}s. Retry after that.`);
+  }
+
+  const lockSeconds = Math.min(LOCK_MAX_S, Math.max(0, args.lock ?? LOCK_DEFAULT_S));
+  acquireDeviceLock(deviceId, lockSeconds);
+
+  // Strip lock param before sending to device
+  const { lock: _lock, ...deviceArgs } = args;
+  const params = Object.keys(deviceArgs).length > 0 ? deviceArgs : undefined;
+
+  const result = await sendCommandAdb(command, params);
 
   if (!result.success) return err(result.error || "Command failed");
 
@@ -536,8 +745,8 @@ function handleSetTransport(mode) {
     if (!adbAvailable()) return err("No ADB device connected.");
     if (!adbServerRunning())
       return err(
-        "ADB server not responding.\n" +
-          "Fix: in BOB Control app → Step 6, toggle ADB server ON.\n" +
+        "ADB server not responding on device.\n" +
+          "Fix: use phone_enable_adb (via cloud) to start it remotely, or toggle ADB server ON in BOB Control app → Step 6.\n" +
           "Also check: USB cable connected and 'adb devices' shows your device."
       );
     transport = "adb";
@@ -551,13 +760,26 @@ function handleSetTransport(mode) {
   return err('Invalid mode. Use "adb" or "cloud".');
 }
 
+function handleUnlock(deviceId) {
+  if (transport === "adb") {
+    releaseDeviceLock(deviceId || adbSerial || "adb-local");
+    return ok("Device unlocked.");
+  }
+  // Cloud mode — proxy to server (it handles its own lock)
+  // Fall through to cloudMcpCall would be ideal but we handle it here
+  // since unlock is in META_TOOLS. For cloud, just release local lock
+  // and note the server lock is managed server-side.
+  return ok("Cloud device lock is managed server-side. The lock will expire automatically.");
+}
+
 function handleStatus() {
-  const hasAdb = adbAvailable();
+  const devices = listAdbDevices();
   const authed = isAuthenticated();
+  const adbServerOk = transport === "adb" || (devices.length > 0 && adbServerRunning());
   const info = [
     `Transport: ${transport || "not set"}`,
-    `ADB device: ${hasAdb ? "connected" : "not found"}`,
-    `ADB server: ${transport === "adb" ? "active" : hasAdb ? "not checked" : "n/a"}`,
+    `ADB devices: ${devices.length > 0 ? devices.map((d) => `${d.serial} (${d.model || d.product})${d.serial === adbSerial ? " ← selected" : ""}`).join(", ") : "none"}`,
+    `ADB server: ${adbServerOk ? "running" : devices.length > 0 ? "not running (use phone_enable_adb)" : "n/a"}`,
     `Cloud auth: ${authed ? "logged in" : "not logged in"}`,
     `Cloud session: ${cloudSessionId || "none"}`,
   ];
@@ -613,10 +835,12 @@ rl.on("line", async (line) => {
       });
       break;
 
-    case "notifications/initialized":
-      if (adbAvailable() && adbServerRunning()) {
+    case "notifications/initialized": {
+      const devices = listAdbDevices();
+      if (devices.length === 1) adbSerial = devices[0].serial;
+      if (devices.length > 0 && adbServerRunning()) {
         transport = "adb";
-        log("Auto-detected ADB device → local transport");
+        log(`Auto-detected ADB device → local transport${adbSerial ? ` (${adbSerial})` : ""}`);
       } else if (isAuthenticated()) {
         transport = "cloud";
         log("Using cloud transport (authenticated)");
@@ -624,6 +848,7 @@ rl.on("line", async (line) => {
         log("No transport detected. Connect ADB or use phone_authenticate.");
       }
       break;
+    }
 
     case "tools/list":
       send({ jsonrpc: "2.0", id, result: { tools: ALL_TOOLS } });
@@ -656,5 +881,14 @@ rl.on("close", () => {
   stdinClosed = true;
   if (pendingRequests === 0) process.exit(0);
 });
+
+// Clean up locks on exit
+function cleanupLocks() {
+  releaseDeviceLock("adb-local");
+  if (adbSerial) releaseDeviceLock(adbSerial);
+}
+process.on("exit", cleanupLocks);
+process.on("SIGINT", () => { cleanupLocks(); process.exit(0); });
+process.on("SIGTERM", () => { cleanupLocks(); process.exit(0); });
 
 log("BOB Control MCP plugin started");
