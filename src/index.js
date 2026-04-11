@@ -40,7 +40,7 @@ function log(msg) {
 // ── Device lock (file-based, cross-process) ──
 
 const LOCK_DIR = path.join(os.homedir(), ".bob-control-mcp");
-const LOCK_DEFAULT_S = 10;
+const LOCK_DEFAULT_S = 2;
 const LOCK_MAX_S = 120;
 const MY_PID = process.pid;
 
@@ -612,7 +612,12 @@ async function executeAdb(name, args, serial) {
   // Device lock
   const lockCheck = checkDeviceLock(serial);
   if (lockCheck.locked) {
-    return err(`Device is currently in use by another session (pid ${lockCheck.pid}). It will be available in ~${lockCheck.remainingSeconds}s. Retry after that.`);
+    const wait = lockCheck.remainingSeconds;
+    return err(
+      `Device busy: another session is running a command on it. ` +
+      `Please wait ~${wait}s and retry the same call — no user action needed, ` +
+      `the lock will clear automatically.`
+    );
   }
 
   const lockSeconds = Math.min(LOCK_MAX_S, Math.max(0, args.lock ?? LOCK_DEFAULT_S));
@@ -755,7 +760,7 @@ rl.on("line", async (line) => {
         result: {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "bob-control", version: "1.1.0" },
+          serverInfo: { name: "bob-control", version: "1.2.0" },
         },
       });
       break;
