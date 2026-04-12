@@ -588,13 +588,37 @@ async function executeTool(name, args) {
     return await cloudMcpCall(name, toolArgs);
   } catch (e) {
     if (e.code === "ECONNREFUSED" || e.message?.includes("ECONNREFUSED")) {
+      // Port forward may have been lost (USB reconnect, device restart).
+      // Clear cache and retry once before giving up.
+      const route = resolveTransport(args);
+      if (route.transport === "adb" && route.serial) {
+        const cache = adbDeviceCache.get(route.serial);
+        if (cache?.portForwarded) {
+          cache.portForwarded = false;
+          cache.token = null;
+          adbDeviceCache.set(route.serial, cache);
+          try {
+            ensureAdbForward(route.serial);
+            const { transport: _t, device_id: _d, ...toolArgs } = args;
+            return await executeAdb(name, toolArgs, route.serial);
+          } catch (retryErr) {
+            // Retry also failed — fall through to error message
+          }
+        }
+      }
       return err(
         "Cannot connect to ADB server on device.\n" +
         "Fix: in BOB Control app, toggle ADB server OFF then ON."
       );
     }
     if (e.code === "ECONNRESET" || e.message?.includes("socket hang up")) {
-      return err("Connection lost. Fix: restart MCP server or re-plug USB cable.");
+      // Clear port-forward cache so next call re-establishes it
+      const route = resolveTransport(args);
+      if (route.transport === "adb" && route.serial) {
+        const cache = adbDeviceCache.get(route.serial);
+        if (cache) { cache.portForwarded = false; adbDeviceCache.set(route.serial, cache); }
+      }
+      return err("Connection lost. The next command will auto-reconnect. If it persists, re-plug USB cable.");
     }
     return err(e.message);
   }
