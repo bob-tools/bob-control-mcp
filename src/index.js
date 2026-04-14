@@ -33,9 +33,34 @@ let cloudSessionId = null;
 
 // ── Logging ──
 
+const LOG_DIR = path.join(os.homedir(), ".bob-control-mcp", "logs");
+const ERROR_LOG = path.join(LOG_DIR, "errors.log");
+const SESSION_LOG = path.join(LOG_DIR, `session-${new Date().toISOString().slice(0, 10)}.log`);
+
 function log(msg) {
-  process.stderr.write(`[bob-control] ${msg}\n`);
+  const line = `[bob-control ${new Date().toISOString()}] ${msg}\n`;
+  try { process.stderr.write(line); } catch {}
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(SESSION_LOG, line);
+  } catch {}
 }
+
+function logError(where, err) {
+  const stamp = new Date().toISOString();
+  const stack = err?.stack || err?.message || String(err);
+  const block = `\n─── ${stamp} | pid=${process.pid} | ${where} ───\n${stack}\n`;
+  try { process.stderr.write(`[bob-control] ERROR in ${where}: ${err?.message || err}\n`); } catch {}
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(ERROR_LOG, block);
+    fs.appendFileSync(SESSION_LOG, block);
+  } catch {}
+}
+
+// Never let an async error kill the process — MCP clients see that as "transport broken".
+process.on("uncaughtException", (e) => logError("uncaughtException", e));
+process.on("unhandledRejection", (e) => logError("unhandledRejection", e));
 
 // ── Device lock (file-based, cross-process) ──
 
@@ -114,7 +139,7 @@ function adbCmd(serial) {
 /** Parse `adb devices -l` into [{serial, model, product, device}]. */
 function listAdbDevices() {
   try {
-    const out = execSync(`${ADB_BIN} devices -l`, { stdio: "pipe", encoding: "utf-8", timeout: 5000 });
+    const out = execSync(`${ADB_BIN} devices -l`, { stdio: "pipe", encoding: "utf-8", timeout: 2000 });
     return out.trim().split("\n").slice(1)
       .filter((l) => /\s+device\b/.test(l))
       .map((line) => {
@@ -132,7 +157,7 @@ function listAdbDevices() {
 function ensureAdbForward(serial) {
   const cache = adbDeviceCache.get(serial) || {};
   if (cache.portForwarded) return;
-  execSync(`${adbCmd(serial)}forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 5000 });
+  execSync(`${adbCmd(serial)}forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 3000 });
   cache.portForwarded = true;
   adbDeviceCache.set(serial, cache);
 }
@@ -142,7 +167,7 @@ function fetchAdbToken(serial) {
   const now = Date.now();
   if (cache.token && now - cache.tokenFetchedAt < 14 * 60 * 1000) return cache.token;
   cache.token = execSync(`${adbCmd(serial)}shell run-as bob.tools.control cat files/adb_token`, {
-    stdio: "pipe", encoding: "utf-8", timeout: 5000,
+    stdio: "pipe", encoding: "utf-8", timeout: 3000,
   }).trim();
   cache.tokenFetchedAt = now;
   adbDeviceCache.set(serial, cache);
@@ -211,7 +236,7 @@ function httpRequest(url, method, body, headers = {}) {
       });
     });
     req.on("error", reject);
-    req.setTimeout(65000, () => { req.destroy(); reject(new Error("Request timed out")); });
+    req.setTimeout(30000, () => { req.destroy(); reject(new Error("Request timed out after 30s")); });
     if (bodyStr) req.write(bodyStr);
     req.end();
   });
@@ -399,6 +424,20 @@ const DEVICE_TOOLS = [
     },
   },
   {
+    name: "phone_drag",
+    description: "Perform a drag gesture (long-press then move). Use for drag-and-drop operations.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        startX: { type: "number" }, startY: { type: "number" },
+        endX: { type: "number" }, endY: { type: "number" },
+        duration: { type: "number", description: "Duration of the move in ms (default: 1000)" },
+        ...ROUTING_PROPS, ...LOCK_PROP,
+      },
+      required: ["startX", "startY", "endX", "endY"],
+    },
+  },
+  {
     name: "phone_type",
     description: "Type text into the currently focused input field.",
     inputSchema: {
@@ -502,6 +541,7 @@ const TOOL_TO_ADB_COMMAND = {
   phone_tap: "tap",
   phone_tap_text: "find_and_tap",
   phone_swipe: "swipe",
+  phone_drag: "drag",
   phone_type: "type",
   phone_press_back: "press_back",
   phone_press_home: "press_home",
@@ -755,7 +795,12 @@ function err(text) {
 // ── MCP stdio protocol ──
 
 function send(msg) {
-  process.stdout.write(JSON.stringify(msg) + "\n");
+  try {
+    process.stdout.write(JSON.stringify(msg) + "\n");
+  } catch (e) {
+    // EPIPE etc — stdout closed. Log and keep running; exit handling is owned by rl.close.
+    logError("send", e);
+  }
 }
 
 let pendingRequests = 0;
@@ -771,51 +816,62 @@ function trackRequest(promise) {
 
 const rl = createInterface({ input: process.stdin });
 
-rl.on("line", async (line) => {
+rl.on("line", (line) => {
   let request;
-  try { request = JSON.parse(line); } catch { return; }
+  try { request = JSON.parse(line); } catch (e) { logError("parse-line", e); return; }
 
   const { id, method, params } = request;
 
-  switch (method) {
-    case "initialize":
-      send({
-        jsonrpc: "2.0", id,
-        result: {
-          protocolVersion: "2024-11-05",
-          capabilities: { tools: {} },
-          serverInfo: { name: "bob-control", version: "1.2.0" },
-        },
-      });
-      break;
+  try {
+    switch (method) {
+      case "initialize":
+        send({
+          jsonrpc: "2.0", id,
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: { tools: {} },
+            serverInfo: { name: "bob-control", version: "1.2.3" },
+          },
+        });
+        break;
 
-    case "notifications/initialized":
-      log("BOB Control ready (stateless transport — specify transport/device_id per call or auto-detect)");
-      break;
+      case "notifications/initialized":
+        log("BOB Control ready (stateless transport — specify transport/device_id per call or auto-detect)");
+        break;
 
-    case "tools/list":
-      send({ jsonrpc: "2.0", id, result: { tools: ALL_TOOLS } });
-      break;
+      case "tools/list":
+        send({ jsonrpc: "2.0", id, result: { tools: ALL_TOOLS } });
+        break;
 
-    case "tools/call": {
-      const toolName = params?.name;
-      const toolArgs = params?.arguments || {};
-      log(`${toolName} ${JSON.stringify(toolArgs)}`);
-      trackRequest(
-        Promise.resolve(executeTool(toolName, toolArgs)).then((result) => {
-          // handleListDevices may return a promise for cloud
-          return Promise.resolve(result);
-        }).then((result) => {
-          send({ jsonrpc: "2.0", id, result });
-        })
-      );
-      break;
-    }
-
-    default:
-      if (id !== undefined) {
-        send({ jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } });
+      case "tools/call": {
+        const toolName = params?.name;
+        const toolArgs = params?.arguments || {};
+        log(`${toolName} ${JSON.stringify(toolArgs)}`);
+        trackRequest(
+          Promise.resolve()
+            .then(() => executeTool(toolName, toolArgs))
+            .then((result) => send({ jsonrpc: "2.0", id, result }))
+            .catch((e) => {
+              logError(`tools/call ${toolName}`, e);
+              send({
+                jsonrpc: "2.0", id,
+                result: { isError: true, content: [{ type: "text", text: `Internal error: ${e?.message || e}` }] },
+              });
+            })
+        );
+        break;
       }
+
+      default:
+        if (id !== undefined) {
+          send({ jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } });
+        }
+    }
+  } catch (e) {
+    logError(`dispatch ${method}`, e);
+    if (id !== undefined) {
+      send({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${e?.message || e}` } });
+    }
   }
 });
 
