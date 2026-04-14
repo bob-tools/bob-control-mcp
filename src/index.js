@@ -162,6 +162,30 @@ function ensureAdbForward(serial) {
   adbDeviceCache.set(serial, cache);
 }
 
+/**
+ * Unconditional forward recreate — use for recovery after connection failure.
+ * Removes any stale forward first, then re-adds. Also clears token cache.
+ */
+function forceAdbForward(serial) {
+  log(`recovery: re-creating adb forward for ${serial}`);
+  const cache = adbDeviceCache.get(serial) || {};
+  cache.portForwarded = false;
+  cache.token = null;
+  cache.tokenFetchedAt = 0;
+  adbDeviceCache.set(serial, cache);
+  try { execSync(`${adbCmd(serial)}forward --remove tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 2000 }); } catch {}
+  execSync(`${adbCmd(serial)}forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 3000 });
+  cache.portForwarded = true;
+  adbDeviceCache.set(serial, cache);
+}
+
+/** Try to resurrect adb daemon if it died. Returns true if device is visible after. */
+function recoverAdbDaemon(serial) {
+  log(`recovery: adb start-server`);
+  try { execSync(`${ADB_BIN} start-server`, { stdio: "pipe", timeout: 5000 }); } catch (e) { logError("adb start-server", e); }
+  return listAdbDevices().some((d) => d.serial === serial);
+}
+
 function fetchAdbToken(serial) {
   const cache = adbDeviceCache.get(serial) || {};
   const now = Date.now();
@@ -600,68 +624,99 @@ function resolveTransport(args) {
 
 // ── Tool execution ──
 
+/**
+ * Classify an ADB-path error into a recovery strategy.
+ * - "connection": forward gone or in-app server not listening → re-create forward
+ * - "daemon": adb daemon dead or device not visible → adb start-server
+ * - "token": auth failed → already retried inline; give up
+ * - "other": non-recoverable
+ */
+function classifyAdbError(e) {
+  const msg = (e?.message || "") + " " + (e?.code || "");
+  if (msg.includes("ECONNREFUSED") || msg.includes("ECONNRESET") || msg.includes("socket hang up") || msg.includes("timed out")) return "connection";
+  if (msg.includes("no devices") || msg.includes("device not found") || msg.includes("cannot connect to daemon") || msg.includes("device offline")) return "daemon";
+  if (msg.includes("Unauthorized")) return "token";
+  return "other";
+}
+
 async function executeTool(name, args) {
+  // Meta tools — no transport needed
+  if (name === "phone_authenticate") return await handleAuthenticate();
+  if (name === "phone_logout") return handleLogout();
+  if (name === "phone_status") return handleStatus();
+  if (name === "phone_unlock_device") return handleUnlock(args.device_id);
+  if (name === "phone_list_devices") return handleListDevices(args.transport);
+
+  // Resolve transport for device commands
+  const route = resolveTransport(args);
+  if (route.error) return err(route.error);
+
+  // Strip routing params before forwarding
+  const { transport: _t, device_id: _d, ...toolArgs } = args;
+
+  if (route.transport === "adb") {
+    return await executeAdbWithRecovery(name, toolArgs, route.serial);
+  }
+
+  // Cloud — pass device_id through if specified
+  if (route.deviceId) toolArgs.device_id = route.deviceId;
   try {
-    // Meta tools — no transport needed
-    if (name === "phone_authenticate") return await handleAuthenticate();
-    if (name === "phone_logout") return handleLogout();
-    if (name === "phone_status") return handleStatus();
-    if (name === "phone_unlock_device") return handleUnlock(args.device_id);
-
-    if (name === "phone_list_devices") {
-      return handleListDevices(args.transport);
-    }
-
-    // Resolve transport for device commands
-    const route = resolveTransport(args);
-    if (route.error) return err(route.error);
-
-    // Strip routing params before forwarding
-    const { transport: _t, device_id: _d, ...toolArgs } = args;
-
-    if (route.transport === "adb") {
-      return await executeAdb(name, toolArgs, route.serial);
-    }
-
-    // Cloud — pass device_id through if specified
-    if (route.deviceId) toolArgs.device_id = route.deviceId;
     return await cloudMcpCall(name, toolArgs);
   } catch (e) {
-    if (e.code === "ECONNREFUSED" || e.message?.includes("ECONNREFUSED")) {
-      // Port forward may have been lost (USB reconnect, device restart).
-      // Clear cache and retry once before giving up.
-      const route = resolveTransport(args);
-      if (route.transport === "adb" && route.serial) {
-        const cache = adbDeviceCache.get(route.serial);
-        if (cache?.portForwarded) {
-          cache.portForwarded = false;
-          cache.token = null;
-          adbDeviceCache.set(route.serial, cache);
-          try {
-            ensureAdbForward(route.serial);
-            const { transport: _t, device_id: _d, ...toolArgs } = args;
-            return await executeAdb(name, toolArgs, route.serial);
-          } catch (retryErr) {
-            // Retry also failed — fall through to error message
-          }
-        }
-      }
-      return err(
-        "Cannot connect to ADB server on device.\n" +
-        "Fix: in BOB Control app, toggle ADB server OFF then ON."
-      );
-    }
-    if (e.code === "ECONNRESET" || e.message?.includes("socket hang up")) {
-      // Clear port-forward cache so next call re-establishes it
-      const route = resolveTransport(args);
-      if (route.transport === "adb" && route.serial) {
-        const cache = adbDeviceCache.get(route.serial);
-        if (cache) { cache.portForwarded = false; adbDeviceCache.set(route.serial, cache); }
-      }
-      return err("Connection lost. The next command will auto-reconnect. If it persists, re-plug USB cable.");
-    }
+    logError(`cloud ${name}`, e);
     return err(e.message);
   }
+}
+
+/**
+ * Auto-recovery wrapper. Up to 3 attempts with different recovery actions:
+ *   1. first fail → force-recreate adb forward (handles port forward lost / cache stale)
+ *   2. second fail → adb start-server (handles daemon death)
+ *   3. third fail → give up with actionable message
+ */
+async function executeAdbWithRecovery(name, args, serial) {
+  const MAX_ATTEMPTS = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await executeAdb(name, args, serial);
+    } catch (e) {
+      lastErr = e;
+      const kind = classifyAdbError(e);
+      log(`ADB ${name} attempt ${attempt}/${MAX_ATTEMPTS} failed (${kind}): ${e?.message || e}`);
+      if (attempt === MAX_ATTEMPTS) break;
+
+      if (kind === "connection") {
+        try { forceAdbForward(serial); } catch (rerr) { logError("forceAdbForward", rerr); }
+      } else if (kind === "daemon") {
+        if (!recoverAdbDaemon(serial)) {
+          // Device really gone — don't keep retrying
+          break;
+        }
+        try { forceAdbForward(serial); } catch (rerr) { logError("forceAdbForward after daemon", rerr); }
+      } else {
+        // token/other — inline retry in sendCommandAdb already ran; don't loop
+        break;
+      }
+    }
+  }
+
+  logError(`ADB ${name} gave up`, lastErr);
+  const kind = classifyAdbError(lastErr);
+  if (kind === "connection") {
+    return err(
+      "Cannot connect to ADB server on device after auto-recovery.\n" +
+      "Likely: BOB Control app's ADB server is off or the app process was killed.\n" +
+      "Fix: in BOB Control app, toggle ADB server OFF then ON."
+    );
+  }
+  if (kind === "daemon") {
+    return err(
+      "ADB daemon unavailable after auto-recovery.\n" +
+      "Fix: re-plug USB cable, or run `adb kill-server && adb start-server`."
+    );
+  }
+  return err(lastErr?.message || "ADB command failed");
 }
 
 async function executeAdb(name, args, serial) {
@@ -830,7 +885,7 @@ rl.on("line", (line) => {
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "bob-control", version: "1.2.3" },
+            serverInfo: { name: "bob-control", version: "1.2.4" },
           },
         });
         break;
