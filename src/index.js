@@ -346,73 +346,46 @@ async function cloudMcpCall(toolName, toolArgs) {
 // ── Tool definitions ──
 
 const ROUTING_PROPS = {
-  transport: {
-    type: "string", enum: ["adb", "cloud"],
-    description: 'Transport mode. "adb" for local USB, "cloud" for remote relay. Auto-detected if omitted.',
-  },
-  device_id: {
-    type: "string",
-    description: "Device ID: ADB serial (from phone_list_devices) or cloud device ID. Auto-detected if only one device.",
-  },
+  transport: { type: "string", enum: ["adb", "cloud"], description: "adb|cloud (auto)" },
+  device_id: { type: "string", description: "Device id (auto)" },
 };
 
 const LOCK_PROP = {
-  lock: {
-    type: "integer",
-    description: "Exclusive lock duration in seconds (default: 10, max: 120). Prevents other sessions from controlling this device. Set to 0 to skip.",
-  },
+  lock: { type: "integer", description: "Lock secs (default 10, max 120, 0=off)" },
 };
 
 const META_TOOLS = [
-  {
-    name: "phone_authenticate",
-    description: "Log in to BOB Control cloud. Opens browser for OAuth. Required for cloud mode.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "phone_logout",
-    description: "Log out from BOB Control cloud. Clears stored tokens.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "phone_status",
-    description: "Show connection status: ADB devices, cloud auth, available transports.",
-    inputSchema: { type: "object", properties: {} },
-  },
+  { name: "phone_authenticate", description: "OAuth login (cloud).", inputSchema: { type: "object", properties: {} } },
+  { name: "phone_logout", description: "Clear cloud tokens.", inputSchema: { type: "object", properties: {} } },
+  { name: "phone_status", description: "Connection status.", inputSchema: { type: "object", properties: {} } },
   {
     name: "phone_list_devices",
-    description: "List available devices. Shows ADB-connected devices and/or cloud-registered devices.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        transport: ROUTING_PROPS.transport,
-      },
-    },
+    description: "List devices.",
+    inputSchema: { type: "object", properties: { transport: ROUTING_PROPS.transport } },
   },
   {
     name: "phone_unlock_device",
-    description: "Release the exclusive lock on a device, allowing other sessions to control it.",
-    inputSchema: {
-      type: "object",
-      properties: { device_id: ROUTING_PROPS.device_id },
-    },
+    description: "Release device lock.",
+    inputSchema: { type: "object", properties: { device_id: ROUTING_PROPS.device_id } },
   },
 ];
 
 const DEVICE_TOOLS = [
   {
-    name: "phone_screenshot",
-    description: "Take a screenshot of the phone screen. Returns JPEG image.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
-  },
-  {
-    name: "phone_get_ui_tree",
-    description: "Get the UI accessibility tree. Returns text content, bounds, and element type.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
+    name: "phone_screen",
+    description: "Read screen: active app + UI elements. detail=simple (default, text+taps only) or full. screenshot=true adds JPEG (<=1024px longer edge); response `screenshot_scale` maps image→device px (device_x=image_x/scale).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        detail: { type: "string", enum: ["simple", "full"], description: "simple (default) or full" },
+        screenshot: { type: "boolean", description: "Include JPEG (default false)" },
+        ...ROUTING_PROPS, ...LOCK_PROP,
+      },
+    },
   },
   {
     name: "phone_tap",
-    description: "Tap at specific screen coordinates.",
+    description: "Tap at (x, y).",
     inputSchema: {
       type: "object",
       properties: { x: { type: "number" }, y: { type: "number" }, ...ROUTING_PROPS, ...LOCK_PROP },
@@ -421,13 +394,13 @@ const DEVICE_TOOLS = [
   },
   {
     name: "phone_tap_text",
-    description: "Find a UI element by visible text/description and tap on it. More reliable than coordinates.",
+    description: "Tap element by text/description (preferred over coords).",
     inputSchema: {
       type: "object",
       properties: {
-        text: { type: "string", description: "Text or content description to find" },
-        exact: { type: "boolean", description: "Exact match (default: false)" },
-        index: { type: "integer", description: "Which match to tap (0-based)" },
+        text: { type: "string" },
+        exact: { type: "boolean", description: "Exact match (default false)" },
+        index: { type: "integer", description: "0-based match index" },
         ...ROUTING_PROPS, ...LOCK_PROP,
       },
       required: ["text"],
@@ -435,13 +408,13 @@ const DEVICE_TOOLS = [
   },
   {
     name: "phone_swipe",
-    description: "Perform a swipe gesture.",
+    description: "Swipe start→end.",
     inputSchema: {
       type: "object",
       properties: {
         startX: { type: "number" }, startY: { type: "number" },
         endX: { type: "number" }, endY: { type: "number" },
-        duration: { type: "number", description: "Duration in ms (default: 300)" },
+        duration: { type: "number", description: "ms (default 300)" },
         ...ROUTING_PROPS, ...LOCK_PROP,
       },
       required: ["startX", "startY", "endX", "endY"],
@@ -449,13 +422,13 @@ const DEVICE_TOOLS = [
   },
   {
     name: "phone_drag",
-    description: "Perform a drag gesture (long-press then move). Use for drag-and-drop operations.",
+    description: "Long-press and drag start→end.",
     inputSchema: {
       type: "object",
       properties: {
         startX: { type: "number" }, startY: { type: "number" },
         endX: { type: "number" }, endY: { type: "number" },
-        duration: { type: "number", description: "Duration of the move in ms (default: 1000)" },
+        duration: { type: "number", description: "ms (default 1000)" },
         ...ROUTING_PROPS, ...LOCK_PROP,
       },
       required: ["startX", "startY", "endX", "endY"],
@@ -463,50 +436,30 @@ const DEVICE_TOOLS = [
   },
   {
     name: "phone_type",
-    description: "Type text into the currently focused input field.",
+    description: "Type into focused input.",
     inputSchema: {
       type: "object",
       properties: { text: { type: "string" }, ...ROUTING_PROPS, ...LOCK_PROP },
       required: ["text"],
     },
   },
-  {
-    name: "phone_press_back",
-    description: "Press the Back button.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
-  },
-  {
-    name: "phone_press_home",
-    description: "Press the Home button.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
-  },
-  {
-    name: "phone_press_recents",
-    description: "Press the Recent Apps button.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
-  },
-  {
-    name: "phone_get_apps",
-    description: "List installed apps.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
-  },
+  { name: "phone_press_back", description: "Back button.", inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } } },
+  { name: "phone_press_home", description: "Home button.", inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } } },
+  { name: "phone_press_recents", description: "Recents button.", inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } } },
+  { name: "phone_get_apps", description: "List installed apps.", inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } } },
   {
     name: "phone_open_app",
-    description: "Open an app by package name.",
+    description: "Open app by package.",
     inputSchema: {
       type: "object",
       properties: { package: { type: "string" }, ...ROUTING_PROPS, ...LOCK_PROP },
       required: ["package"],
     },
   },
-  {
-    name: "phone_get_notifications",
-    description: "Get active notifications.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
-  },
+  { name: "phone_get_notifications", description: "Active notifications.", inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } } },
   {
     name: "phone_open_notification",
-    description: "Open a notification by key.",
+    description: "Open notification by key.",
     inputSchema: {
       type: "object",
       properties: { key: { type: "string" }, ...ROUTING_PROPS, ...LOCK_PROP },
@@ -515,43 +468,32 @@ const DEVICE_TOOLS = [
   },
   {
     name: "phone_dismiss_notification",
-    description: "Dismiss a notification by key.",
+    description: "Dismiss notification by key.",
     inputSchema: {
       type: "object",
       properties: { key: { type: "string" }, ...ROUTING_PROPS, ...LOCK_PROP },
       required: ["key"],
     },
   },
-  {
-    name: "phone_dismiss_all_notifications",
-    description: "Dismiss all notifications.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
-  },
+  { name: "phone_dismiss_all_notifications", description: "Dismiss all notifications.", inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } } },
   {
     name: "phone_enable_adb",
-    description: "Enable ADB local server on the device. Returns port and auth token.",
+    description: "Enable device ADB server.",
     inputSchema: {
       type: "object",
       properties: {
-        auto_start: { type: "boolean", description: "Auto-start on service restart (default: true)" },
+        auto_start: { type: "boolean", description: "Auto-start on restart (default true)" },
         ...ROUTING_PROPS, ...LOCK_PROP,
       },
     },
   },
-  {
-    name: "phone_disable_adb",
-    description: "Disable ADB local server on the device.",
-    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
-  },
+  { name: "phone_disable_adb", description: "Disable device ADB server.", inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } } },
   {
     name: "phone_check_command",
-    description: "Check the result of a previously sent cloud command.",
+    description: "Check async cloud command result.",
     inputSchema: {
       type: "object",
-      properties: {
-        command_id: { type: "string", description: "Command ID to check" },
-        ...ROUTING_PROPS,
-      },
+      properties: { command_id: { type: "string" }, ...ROUTING_PROPS },
       required: ["command_id"],
     },
   },
@@ -560,8 +502,7 @@ const DEVICE_TOOLS = [
 const ALL_TOOLS = [...META_TOOLS, ...DEVICE_TOOLS];
 
 const TOOL_TO_ADB_COMMAND = {
-  phone_screenshot: "screenshot",
-  phone_get_ui_tree: "get_ui_tree",
+  phone_screen: "screen",
   phone_tap: "tap",
   phone_tap_text: "find_and_tap",
   phone_swipe: "swipe",
@@ -660,12 +601,38 @@ async function executeTool(name, args) {
 
   // Cloud — pass device_id through if specified
   if (route.deviceId) toolArgs.device_id = route.deviceId;
+
+  // For phone_screen, translate high-level args into device-command params before sending.
+  let screenDetail = "simple";
+  if (name === "phone_screen") {
+    screenDetail = toolArgs.detail === "full" ? "full" : "simple";
+    const wantShot = toolArgs.screenshot === true;
+    delete toolArgs.detail;
+    delete toolArgs.screenshot;
+    if (wantShot) {
+      toolArgs.screenshot = true;
+      toolArgs.max_size = 1024;
+    }
+  }
+
   try {
-    return await cloudMcpCall(name, toolArgs);
+    const result = await cloudMcpCall(name, toolArgs);
+    if (name === "phone_screen") return reformatCloudScreenResult(result, screenDetail);
+    return result;
   } catch (e) {
     logError(`cloud ${name}`, e);
     return err(e.message);
   }
+}
+
+/** Cloud returns `screen` data as a JSON text block. Parse it and apply the same formatting as ADB. */
+function reformatCloudScreenResult(result, detail) {
+  if (!result || !Array.isArray(result.content)) return result;
+  const textBlock = result.content.find((c) => c?.type === "text");
+  if (!textBlock?.text) return result;
+  let data;
+  try { data = JSON.parse(textBlock.text); } catch { return result; }
+  return formatScreenResult(data, detail);
 }
 
 /**
@@ -744,18 +711,78 @@ async function executeAdb(name, args, serial) {
 
   // Strip lock param before sending to device
   const { lock: _lock, ...deviceArgs } = args;
-  const params = Object.keys(deviceArgs).length > 0 ? deviceArgs : undefined;
+  let params = Object.keys(deviceArgs).length > 0 ? deviceArgs : undefined;
+
+  // phone_screen: translate detail/screenshot args into device params
+  let detail = "simple";
+  if (command === "screen") {
+    detail = deviceArgs.detail === "full" ? "full" : "simple";
+    const screenshot = deviceArgs.screenshot === true;
+    params = screenshot ? { screenshot: true, max_size: 1024 } : undefined;
+  }
 
   const result = await sendCommandAdb(serial, command, params);
 
   if (!result.success) return err(result.error || "Command failed");
 
-  if (command === "screenshot" && typeof result.data === "string") {
-    return { content: [{ type: "image", data: result.data, mimeType: "image/jpeg" }] };
+  if (command === "screen") {
+    return formatScreenResult(result.data, detail);
   }
 
   const text = typeof result.data === "string" ? result.data : JSON.stringify(result.data, null, 2);
   return ok(text);
+}
+
+/** Keep only elements useful for acting on the screen: text/desc or tappable. */
+function simplifyElements(elements) {
+  if (!Array.isArray(elements)) return elements;
+  return elements
+    .filter((el) => el && (el.text || el.desc || el.click === true))
+    .map((el) => {
+      const out = {};
+      if (el.text) out.text = el.text;
+      if (el.desc) out.desc = el.desc;
+      if (el.bounds) out.bounds = el.bounds;
+      if (el.click) out.click = true;
+      if (el.edit) out.edit = true;
+      if (el.checked) out.checked = true;
+      if (el.focused) out.focused = true;
+      if (el.id) out.id = el.id;
+      return out;
+    });
+}
+
+function formatScreenResult(data, detail) {
+  if (!data || typeof data !== "object") {
+    return ok(typeof data === "string" ? data : JSON.stringify(data, null, 2));
+  }
+  const {
+    screenshot, screenshot_scale, screenshot_width, screenshot_height,
+    device_width, device_height, elements, ...rest
+  } = data;
+
+  const payload = {
+    app: rest.app,
+    title: rest.title,
+    elements: detail === "full" ? elements : simplifyElements(elements),
+  };
+
+  if (screenshot) {
+    payload.screenshot = {
+      scale: screenshot_scale ?? 1,
+      width: screenshot_width,
+      height: screenshot_height,
+      device_width,
+      device_height,
+      note: "To tap on device pixels given image coords: device_x = image_x / scale, device_y = image_y / scale.",
+    };
+  }
+
+  const content = [{ type: "text", text: JSON.stringify(payload, null, 2) }];
+  if (screenshot && typeof screenshot === "string") {
+    content.push({ type: "image", data: screenshot, mimeType: "image/jpeg" });
+  }
+  return { content };
 }
 
 // ── Handlers ──
