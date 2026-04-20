@@ -1,6 +1,6 @@
 {
   "name": "bob-control-mcp",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "MCP plugin for remote Android phone control — ADB (local) or cloud relay",
   "type": "module",
   "main": "src/index.js",
