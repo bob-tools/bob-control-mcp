@@ -21,13 +21,14 @@ import { authorize, getAccessToken, isAuthenticated, logout } from "./oauth.js";
 
 // ── Config ──
 
-const ADB_PORT = 7071;
+const ADB_REMOTE_PORT = 7071;
+const ADB_LOCAL_PORT_BASE = 17070; // Unique local port per device (base + hash%1000)
 const CLOUD_MCP_URL =
   (process.env.BOB_SERVER_URL?.replace(/\/$/, "") || "https://api.bob.tools") + "/mcp-control";
 
 // ── State (minimal, cached) ──
 
-// ADB per-device cache: serial -> { token, tokenFetchedAt, portForwarded }
+// ADB per-device cache: serial -> { token, tokenFetchedAt, localPort, portForwarded }
 const adbDeviceCache = new Map();
 let cloudSessionId = null;
 
@@ -154,12 +155,30 @@ function listAdbDevices() {
   }
 }
 
+/**
+ * Compute a deterministic per-device local port.
+ * Multiple devices need different local ports — `adb forward tcp:7071 tcp:7071`
+ * can only target ONE device at a time, so sharing the local port causes
+ * silent forward-override bugs when switching between devices.
+ */
+function localPortFor(serial) {
+  if (!serial) return ADB_LOCAL_PORT_BASE;
+  let hash = 0;
+  for (let i = 0; i < serial.length; i++) {
+    hash = ((hash << 5) - hash + serial.charCodeAt(i)) | 0;
+  }
+  return ADB_LOCAL_PORT_BASE + (Math.abs(hash) % 1000);
+}
+
 function ensureAdbForward(serial) {
   const cache = adbDeviceCache.get(serial) || {};
-  if (cache.portForwarded) return;
-  execSync(`${adbCmd(serial)}forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 3000 });
+  if (cache.portForwarded && cache.localPort) return cache.localPort;
+  const localPort = localPortFor(serial);
+  execSync(`${adbCmd(serial)}forward tcp:${localPort} tcp:${ADB_REMOTE_PORT}`, { stdio: "pipe", timeout: 3000 });
   cache.portForwarded = true;
+  cache.localPort = localPort;
   adbDeviceCache.set(serial, cache);
+  return localPort;
 }
 
 /**
@@ -169,14 +188,17 @@ function ensureAdbForward(serial) {
 function forceAdbForward(serial) {
   log(`recovery: re-creating adb forward for ${serial}`);
   const cache = adbDeviceCache.get(serial) || {};
+  const localPort = cache.localPort || localPortFor(serial);
   cache.portForwarded = false;
   cache.token = null;
   cache.tokenFetchedAt = 0;
   adbDeviceCache.set(serial, cache);
-  try { execSync(`${adbCmd(serial)}forward --remove tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 2000 }); } catch {}
-  execSync(`${adbCmd(serial)}forward tcp:${ADB_PORT} tcp:${ADB_PORT}`, { stdio: "pipe", timeout: 3000 });
+  try { execSync(`${adbCmd(serial)}forward --remove tcp:${localPort}`, { stdio: "pipe", timeout: 2000 }); } catch {}
+  execSync(`${adbCmd(serial)}forward tcp:${localPort} tcp:${ADB_REMOTE_PORT}`, { stdio: "pipe", timeout: 3000 });
   cache.portForwarded = true;
+  cache.localPort = localPort;
   adbDeviceCache.set(serial, cache);
+  return localPort;
 }
 
 /** Try to resurrect adb daemon if it died. Returns true if device is visible after. */
@@ -269,41 +291,48 @@ function httpRequest(url, method, body, headers = {}) {
 // ── ADB command execution ──
 
 async function sendCommandAdb(serial, command, params) {
-  ensureAdbForward(serial);
+  let localPort = ensureAdbForward(serial);
   let token = fetchAdbToken(serial);
   let result = await httpRequest(
-    `http://127.0.0.1:${ADB_PORT}/command`, "POST",
+    `http://127.0.0.1:${localPort}/command`, "POST",
     { command, params: params || undefined },
     { Authorization: `Bearer ${token}` }
   );
 
   if (result.status === 401) {
-    // Token expired — force refresh and retry
+    // 401 can mean: token expired OR forward points at another device's server.
+    // Wipe cache and re-establish forward+token from scratch before retrying.
     const cache = adbDeviceCache.get(serial) || {};
     cache.token = null;
     cache.tokenFetchedAt = 0;
+    cache.portForwarded = false;
     adbDeviceCache.set(serial, cache);
     try {
+      localPort = ensureAdbForward(serial);
       token = fetchAdbToken(serial);
       result = await httpRequest(
-        `http://127.0.0.1:${ADB_PORT}/command`, "POST",
+        `http://127.0.0.1:${localPort}/command`, "POST",
         { command, params: params || undefined },
         { Authorization: `Bearer ${token}` }
       );
     } catch (e) {
       throw new Error(
-        "ADB Unauthorized: token refresh failed.\n" +
-        "Fix: restart this MCP server (it will re-read the token from device)."
+        "ADB Unauthorized: retry failed (" + (e?.message || e) + ")."
       );
     }
   }
 
+  if (result.status === 429) {
+    const msg = result.body?.error || "Rate-limited by device ADB server.";
+    throw new Error(`${msg}\nDevice locked out after repeated auth failures; it clears automatically in ~60s.`);
+  }
+
   if (result.status === 401) {
     throw new Error(
-      "ADB Unauthorized even after token refresh.\n" +
+      "ADB Unauthorized after retry.\n" +
       "Possible causes:\n" +
-      "1. ADB server was restarted — restart this MCP server\n" +
-      "2. Accessibility Service is disabled — re-enable in Settings\n" +
+      "1. Accessibility Service is disabled — re-enable in Settings → Accessibility → BOB Control\n" +
+      "2. ADB server on device is OFF — enable it in BOB Control app (Step 6)\n" +
       "3. App was reinstalled — re-enable Accessibility Service"
     );
   }
