@@ -43,6 +43,7 @@ Plugin auto-detects: ADB if a device is connected via USB, otherwise cloud. To s
 | `phone_status` | Show connection status |
 | `phone_screenshot` | Take a screenshot (JPEG) |
 | `phone_get_ui_tree` | Get accessibility tree (preferred for reading text) |
+| `phone_get_settings` | Read device control settings |
 | `phone_tap` | Tap at coordinates |
 | `phone_tap_text` | Tap element by visible text |
 | `phone_swipe` | Swipe gesture |

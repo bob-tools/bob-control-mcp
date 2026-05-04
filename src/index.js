@@ -25,6 +25,7 @@ const ADB_REMOTE_PORT = 7071;
 const ADB_LOCAL_PORT_BASE = 17070; // Unique local port per device (base + hash%1000)
 const CLOUD_MCP_URL =
   (process.env.BOB_SERVER_URL?.replace(/\/$/, "") || "https://api.bob.tools") + "/mcp-control";
+const PACKAGE_VERSION = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
 // ── State (minimal, cached) ──
 
@@ -413,6 +414,11 @@ const DEVICE_TOOLS = [
     },
   },
   {
+    name: "phone_get_settings",
+    description: "Read device control settings: {controlMode: 'full'|'selected', allowedApps: [...]}. Use this before issuing UI commands to know which apps the user permits — commands targeting other apps will be rejected with app_not_allowed.",
+    inputSchema: { type: "object", properties: { ...ROUTING_PROPS, ...LOCK_PROP } },
+  },
+  {
     name: "phone_tap",
     description: "Tap at (x, y).",
     inputSchema: {
@@ -532,6 +538,7 @@ const ALL_TOOLS = [...META_TOOLS, ...DEVICE_TOOLS];
 
 const TOOL_TO_ADB_COMMAND = {
   phone_screen: "screen",
+  phone_get_settings: "get_settings",
   phone_tap: "tap",
   phone_tap_text: "find_and_tap",
   phone_swipe: "swipe",
@@ -941,7 +948,7 @@ rl.on("line", (line) => {
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "bob-control", version: "1.2.4" },
+            serverInfo: { name: "bob-control", version: PACKAGE_VERSION },
           },
         });
         break;
